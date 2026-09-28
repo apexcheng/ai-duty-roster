@@ -7,7 +7,7 @@ description: 根据上月值班表、本月售前/售后人员、指定休息和
 
 用于生成客服售前 / 售后的月度值班表。先读取上月排班与本月用户条件，做可行性检查，再求满足硬约束的排班，并在原工作簿中新增本月 Sheet。
 
-涉及 .xlsx 时先遵循本机 spreadsheet-windows Skill；文件编辑、备份、原生重算和兼容性验证按该 Skill 路由。
+本地 .xlsx 写入直接走 `tencent-local-office-edit` 的 editor_sdk（`edsdk.py`），**不要委派 sheet-agent 子代理**（实测因上游网关空流连续失败，白等十几分钟才能回退）；详见下方「本地写入」。
 
 详细规则、跨月补偿和输出规范见 references/排班规则.md。
 
@@ -77,6 +77,38 @@ description: 根据上月值班表、本月售前/售后人员、指定休息和
 如果模板包含“线下”区域，目前只保留模板，不参与 AI 排班。
 
 TODO：未来支持线下岗位排班。
+
+## 本地写入（editor_sdk，勿委派子代理）
+
+硬规则：先 `cp` 一份副本，全部操作只落副本；排班先在本地 Python 里算完并全量验证通过，再一次性写入；写完读回实盘复验后才报完成。
+
+标准流程（`EDS` = tencent-local-office-edit skill 目录）：
+
+```bash
+cp "<源文件>" "<副本>"
+cd "$EDS" && python edsdk.py call open_file --json '{"file_path":"C:\\...\\副本.xlsx"}'   # 返回的路径字符串即 file_id
+python edsdk.py call sheet_get_sheet_info --json '{"file_id":"..."}'                       # 定位历史 Sheet
+python edsdk.py call sheet_get_cell_data --json '{...,"return_csv":false,"include_formula":true}' > cells.json
+# 本地 python: 解析历史 + 生成排班 + 全量校验（脚本见 scripts/roster_nov.py）
+python edsdk.py call sheet_copy_sheet --json '{"sheet_id":"<历史>","new_name":"M月值班表"}'
+python edsdk.py call sheet_insert_dimension --json '{"sheet_id":"<新>","dimension_type":"row","index":28,"count":5}'  # 每多1周块插5行
+python edsdk.py call sheet_clear_range_cells --json '{...}'          # 清上月残留（线下人员、首周多余日期）
+python edsdk.py call sheet_set_range_value --json-file chunk.json    # 分块写入，见下
+python edsdk.py call sheet_get_cell_data ... > readback.json         # 读回实盘复验（公式计算值在 number_value）
+python edsdk.py call save_file --json '{"file_id":"..."}'
+```
+
+editor_sdk 三个坑：
+
+1. 每个 value 条目必须带 `value_type`：文本 `string_value`、数字 `number_value`、公式 `formula`（公式写后编辑器自动重算，读回 `number_value` 即计算值，可直接比对明细）。
+2. 大批量 `sheet_set_range_value` 偶发 `SetRangeValueWithFormulas: workbook is not open`——**报错文案不可信**：与批量大小无关（实测 2997 条可一次成功）、与公式内容无关。多发于 `open_file` 流式加载未完成、或 pool 存在同路径重复实例时。规避：`open_file` 后先读一次确认加载完成；写前 `get_pool_status` 确认无同路径重复实例；一旦报此错，不要按字面重新打开，按 ≤40 条分块写入（实测必然成功）。
+3. 同一文件可能在 pool 里出现 `C://Users//...` 与 `/Users/...` 两个实例互相遮蔽，先 `get_pool_status` 查清、`close_file` 关掉多余实例再写。
+
+模板版式（0-based，现有工作簿）：列 售前 `1-7`、售后 `9-15`、线下 `17-24`（col17 放“天猫/审单”标签）；周块 = 5 行：`日期/休息简称/早/中/晚`；首末部分周只写存在的日期、其余列清空；线下区是顺序日期网格、只留模板清人员；底部三区（指定休息/请假休息/排班汇总，含合并单元格）随周块扩展整体下移。汇总公式：早班 `=COUNTIF(B6:H6,"*名*")+…`（早班 Excel 行 6/11/16/21/26/31，晚班 8/13/18/23/28/33），正常休息 `=月天数-上班合计-请假`。
+
+跨月校验易误判点：上月最后一天本来休息（月底连跑=0）的员工，本月 1 日可排早班——“禁止晚转早”只针对上月末实际在班晚班者。
+
+脚本资产：`scripts/roster_nov.py`（历史解析→跨月状态→休息预算贪心→全量校验）、`scripts/build_writes.py`（排班结果→带 `value_type` 的 values 数组与清空区坐标）。
 
 ## 用户输入模板
 
